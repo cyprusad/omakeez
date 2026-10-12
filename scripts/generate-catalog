@@ -284,6 +284,21 @@ def atomic_write(path, data):
             os.unlink(temporary)
 
 
+def read_private_text(path):
+    """Read a generated artifact only when it remains a private regular file."""
+    try:
+        info = path.lstat()
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o600
+        ):
+            return None
+        return path.read_text()
+    except OSError:
+        return None
+
+
 def lua_string(value):
     return json.dumps(str(value), ensure_ascii=False).replace("\\u2028", "\\n").replace("\\u2029", "\\n")
 
@@ -341,15 +356,28 @@ def build(args):
                 lua.append(f"    [{lua_string('|'.join(['_'.join(item['modifiers']), str(code), item['phase'], item['submap']]))}] = {lua_string(item['id'])},")
     lua.append("  }\n}\n")
     catalog_path, lua_path = state / "catalog.json", state / "bridge-catalog.lua"
-    old = None
-    try:
-        old = json.loads(catalog_path.read_text()).get("sourceHash")
-    except (OSError, ValueError):
-        pass
-    changed = old != source_hash or not lua_path.exists()
+    catalog_text = json.dumps(catalog, ensure_ascii=False, indent=2) + "\n"
+    lua_text = "\n".join(lua)
+    old_catalog = None
+    old_catalog_text = read_private_text(catalog_path)
+    if old_catalog_text is not None:
+        try:
+            old_catalog = json.loads(old_catalog_text)
+        except ValueError:
+            pass
+    catalog_matches = (
+        isinstance(old_catalog, dict)
+        and old_catalog.get("schemaVersion") == 1
+        and old_catalog.get("sourceHash") == source_hash
+        and old_catalog.get("bindings") == entries
+    )
+    bridge_matches = read_private_text(lua_path) == lua_text
+    changed = not catalog_matches or not bridge_matches
     if changed:
-        atomic_write(catalog_path, json.dumps(catalog, ensure_ascii=False, indent=2) + "\n")
-        atomic_write(lua_path, "\n".join(lua))
+        # Publish the bridge first and catalog.json last. The service treats a
+        # successful process exit as the commit boundary for both artifacts.
+        atomic_write(lua_path, lua_text)
+        atomic_write(catalog_path, catalog_text)
     print(json.dumps({"ok": True, "sourceHash": source_hash, "bindingCount": len(entries), "changed": changed}, separators=(",", ":")))
 
 

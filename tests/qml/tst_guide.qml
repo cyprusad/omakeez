@@ -125,12 +125,20 @@ TestCase {
     var state = {
       integrationState: "enabled",
       catalogState: "ready",
+      lockStateKnown: true,
       desktopLocked: false,
+      credentialPromptStateKnown: true,
       credentialPromptActive: false,
       activeWindowFullscreen: false,
       showInFullscreen: false
     }
     verify(GuideModel.eligible(state))
+    state.lockStateKnown = false
+    verify(!GuideModel.eligible(state))
+    state.lockStateKnown = true
+    state.credentialPromptStateKnown = false
+    verify(!GuideModel.eligible(state))
+    state.credentialPromptStateKnown = true
     state.desktopLocked = true
     verify(!GuideModel.eligible(state))
     state.desktopLocked = false
