@@ -316,6 +316,7 @@ function laneCounts(catalog) {
 
 function eligible(state) {
   if (!state || state.integrationState !== "enabled" || state.catalogState !== "ready") return false
+  if (state.lockStateKnown !== true || state.credentialPromptStateKnown !== true) return false
   if (state.desktopLocked === true || state.credentialPromptActive === true) return false
   return state.showInFullscreen === true || state.activeWindowFullscreen !== true
 }

@@ -21,7 +21,9 @@ Item {
   readonly property bool eligible: service ? GuideModel.eligible({
     integrationState: service.integrationState,
     catalogState: service.catalogState,
+    lockStateKnown: service.lockStateKnown,
     desktopLocked: service.desktopLocked,
+    credentialPromptStateKnown: service.credentialPromptStateKnown,
     credentialPromptActive: service.credentialPromptActive,
     activeWindowFullscreen: service.activeWindowFullscreen,
     showInFullscreen: service.showInFullscreen

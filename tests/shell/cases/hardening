@@ -101,14 +101,96 @@ outside="$fixture/outside.lua"
 printf 'return {}\n' > "$outside"
 [ "$(inspect_reason "$outside")" = outside-safe-root ]
 
+reject_state_dir() {
+  rejected_state=$1
+  config_hash=$(sha256sum "$inode_config" | awk '{print "sha256:" $1}')
+  if "$root/scripts/bridge-control" enable --config "$inode_config" --state-dir "$rejected_state" --expected-hash "$config_hash" --no-live-reload >/dev/null 2>"$fixture/state.err"; then
+    echo "unsafe controller state directory accepted: $rejected_state" >&2
+    exit 1
+  fi
+  grep -q 'unsafe-state-directory' "$fixture/state.err"
+  [ "$(sha256sum "$inode_config" | awk '{print $1}')" = "${config_hash#sha256:}" ]
+}
+
+symlink_target="$fixture/state-symlink-target"
+mkdir "$symlink_target"
+printf 'preserve me\n' > "$symlink_target/sentinel"
+chmod 500 "$symlink_target"
+ln -s "$symlink_target" "$fixture/state-symlink"
+target_hash=$(sha256sum "$symlink_target/sentinel" | awk '{print $1}')
+reject_state_dir "$fixture/state-symlink"
+[ -L "$fixture/state-symlink" ]
+[ "$(stat -c %a "$symlink_target")" = 500 ]
+[ "$(sha256sum "$symlink_target/sentinel" | awk '{print $1}')" = "$target_hash" ]
+[ ! -e "$symlink_target/bridge-control.lock" ]
+chmod 700 "$symlink_target"
+
+dangling_target="$fixture/not-created-state-target"
+ln -s "$dangling_target" "$fixture/dangling-state-symlink"
+reject_state_dir "$fixture/dangling-state-symlink"
+[ -L "$fixture/dangling-state-symlink" ]
+[ ! -e "$dangling_target" ]
+
 unsafe_state="$fixture/unsafe-state"
 mkdir "$unsafe_state"
+printf 'preserve me\n' > "$unsafe_state/sentinel"
 chmod 755 "$unsafe_state"
-if "$root/scripts/bridge-control" enable --config "$inode_config" --state-dir "$unsafe_state" --expected-hash "$(sha256sum "$inode_config" | awk '{print "sha256:" $1}')" --no-live-reload >/dev/null 2>"$fixture/state.err"; then
-  echo "unsafe controller state directory accepted" >&2
-  exit 1
+unsafe_hash=$(sha256sum "$unsafe_state/sentinel" | awk '{print $1}')
+reject_state_dir "$unsafe_state"
+[ "$(stat -c %a "$unsafe_state")" = 755 ]
+[ "$(sha256sum "$unsafe_state/sentinel" | awk '{print $1}')" = "$unsafe_hash" ]
+[ ! -e "$unsafe_state/bridge-control.lock" ]
+
+foreign_state="$fixture/foreign-state"
+mkdir "$foreign_state"
+printf 'preserve me\n' > "$foreign_state/sentinel"
+chmod 500 "$foreign_state"
+foreign_hash=$(sha256sum "$foreign_state/sentinel" | awk '{print $1}')
+foreign_uid=65534
+[ "$(id -u)" = "$foreign_uid" ] && foreign_uid=65533
+if [ "$(id -u)" = 0 ] && chown "$foreign_uid" "$foreign_state" 2>/dev/null; then
+  reject_state_dir "$foreign_state"
+else
+  # On an unprivileged test run, simulate the controller's expected UID so
+  # this ownership check remains covered without requiring chown privileges.
+  python3 - "$root/scripts/bridge-control" "$foreign_state" 2>"$fixture/foreign-state.err" <<'PY'
+import os
+import runpy
+import sys
+
+module = runpy.run_path(sys.argv[1])
+actual_uid = os.getuid
+os.getuid = lambda: actual_uid() + 1
+try:
+    try:
+        module["prepare_state_dir"](module["Path"](sys.argv[2]))
+    except SystemExit as exc:
+        if exc.code != 1:
+            raise
+    else:
+        raise SystemExit("foreign-owned state directory was accepted")
+finally:
+    os.getuid = actual_uid
+PY
+  grep -q 'unsafe-state-directory' "$fixture/foreign-state.err"
 fi
-grep -q 'unsafe-state-directory' "$fixture/state.err"
+[ "$(stat -c %a "$foreign_state")" = 500 ]
+[ "$(sha256sum "$foreign_state/sentinel" | awk '{print $1}')" = "$foreign_hash" ]
+chmod 700 "$foreign_state" 2>/dev/null || true
+chown "$(id -u)" "$foreign_state" 2>/dev/null || true
+chmod 700 "$foreign_state"
+
+state_parent_real="$fixture/state-parent-real"
+mkdir -p "$state_parent_real/omarchy/omakeez"
+chmod 700 "$state_parent_real/omarchy/omakeez"
+ln -s "$state_parent_real" "$fixture/state-parent-link"
+parent_state="$fixture/state-parent-link/omarchy/omakeez"
+parent_state_config="$home/parent-state.lua"
+printf 'return {}\n' > "$parent_state_config"
+parent_state_hash=$(sha256sum "$parent_state_config" | awk '{print "sha256:" $1}')
+"$root/scripts/bridge-control" enable --config "$parent_state_config" --state-dir "$parent_state" --expected-hash "$parent_state_hash" --no-live-reload >/dev/null
+[ -f "$state_parent_real/omarchy/omakeez/bridge-control.lock" ]
+[ -d "$state_parent_real/omarchy/omakeez/backups" ]
 
 fake_bin="$fixture/bin"
 mkdir "$fake_bin"

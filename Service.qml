@@ -12,6 +12,7 @@ Item {
   property var manifest: null
 
   property string integrationState: "disabled"
+  property bool integrationStateKnown: false
   property var integrationDetails: ({})
   property var catalog: null
   property bool guideVisible: false
@@ -25,11 +26,28 @@ Item {
   property bool guideShiftEnabled: true
   property bool guideCtrlEnabled: true
   property bool guideAltEnabled: true
-  property bool desktopLocked: false
-  property bool credentialPromptActive: false
+  // Suppression starts active until both independent sources have answered.
+  // Unknown state must never briefly expose the guide over a protected surface.
+  property bool desktopLocked: true
+  property bool lockStateKnown: false
+  property bool credentialPromptActive: true
+  property bool credentialPromptStateKnown: false
   property bool activeWindowFullscreen: false
+  property bool guideAwaitingLockCheck: false
+  property bool lockStatusRefreshPending: false
+  property bool lockStatusTimedOut: false
+  property bool layerStatusTimedOut: false
+  property bool layerRefreshPending: false
+  property int layerEventRevision: 0
+  property int layerRequestRevision: 0
 
   property string catalogState: "loading"
+  property bool catalogPublicationPending: false
+  property var pendingCatalogGeneration: null
+  property string deferredBridgeReloadSourceHash: ""
+  property string activeBridgeReloadSourceHash: ""
+  property string pendingBridgeReloadSourceHash: ""
+  property string lastBridgeReloadSourceHash: ""
   property string manualSnippet: ""
   property string lastProtocolError: ""
   property int bridgeEventCount: 0
@@ -37,7 +55,9 @@ Item {
     catalogLoadFailures: 0,
     integrationFailures: 0,
     fullscreenQueryCount: 0,
-    fullscreenQueryFailures: 0
+    fullscreenQueryFailures: 0,
+    lockQueryFailures: 0,
+    layerQueryFailures: 0
   })
 
   // These diagnostics remain intentionally in memory only. They are useful to
@@ -88,27 +108,23 @@ Item {
     if (parsed.type === "guide") {
       if (parsed.phase === "down") {
         if (!root.guideRootEnabled(parsed.root)) {
-          activeModifiers = ""
-          activeGuideRoot = ""
-          guideVisible = false
-          pendingGuideReceivedMs = 0
+          root.clearGuide()
           return true
         }
         pendingGuideReceivedMs = Date.now()
         activeGuideRoot = parsed.root
         activeModifiers = parsed.root
         highlightedBindingId = ""
-        guideVisible = true
-      } else {
-        activeModifiers = ""
-        activeGuideRoot = ""
         guideVisible = false
-        pendingGuideReceivedMs = 0
+        guideAwaitingLockCheck = true
+        root.requestLockStatus(true)
+      } else {
+        root.clearGuide()
       }
       return true
     }
     if (parsed.type === "mods") {
-      if (guideVisible) activeModifiers = parsed.modifiers
+      if (guideVisible || guideAwaitingLockCheck) activeModifiers = parsed.modifiers
       return true
     }
     if (parsed.type === "match") {
@@ -131,11 +147,7 @@ Item {
   }
 
   function resetDiagnostics() {
-    guideVisible = false
-    activeModifiers = ""
-    activeGuideRoot = ""
-    highlightedBindingId = ""
-    pendingGuideReceivedMs = 0
+    clearGuide()
     observedEventCount = 0
     bridgeEventCount = 0
     latencySamples = []
@@ -178,7 +190,7 @@ Item {
   function closeGuide() { guideVisible = false }
 
   function settingsEntry() {
-    return Model.settingsFor(shell ? shell.shellConfig : null, root.moduleName)
+    return Model.settingsFor(shell ? shell.barConfig : null, root.moduleName)
   }
 
   function syncSettings() {
@@ -191,20 +203,14 @@ Item {
     guideCtrlEnabled = Model.normalizeGuideRoot(entry.guideCtrlEnabled)
     guideAltEnabled = Model.normalizeGuideRoot(entry.guideAltEnabled)
     if (!guideRootEnabled(activeGuideRoot)) {
-      guideVisible = false
-      activeModifiers = ""
-      activeGuideRoot = ""
+      clearGuide()
     }
   }
 
   function persistSettings(changes) {
     if (!shell || typeof shell.updateEntryInline !== "function") return false
-    var entry = settingsEntry()
-    var next = { id: root.moduleName }
-    for (var key in entry) if (key !== "id") next[key] = entry[key]
-    for (var changed in changes) next[changed] = changes[changed]
-    shell.updateEntryInline(root.moduleName, next)
-    return true
+    var next = Model.updatedSettingsEntry(settingsEntry(), changes, root.moduleName)
+    return shell.updateEntryInline(root.moduleName, next) !== false
   }
 
   function setGuideDelayMs(value) {
@@ -251,53 +257,150 @@ Item {
     else if (rootName === "CTRL") guideCtrlEnabled = next
     else guideAltEnabled = next
     if (!next && activeGuideRoot === rootName) {
-      guideVisible = false
-      activeModifiers = ""
-      activeGuideRoot = ""
+      clearGuide()
     }
     var changes = {}
     changes[setting] = next
     return persistSettings(changes)
   }
 
-  property var lockService: null
-  property var polkitService: null
+  function clearGuide() {
+    guideVisible = false
+    guideAwaitingLockCheck = false
+    activeModifiers = ""
+    activeGuideRoot = ""
+    highlightedBindingId = ""
+    pendingGuideReceivedMs = 0
+  }
 
-  function refreshSuppressionServices() {
-    var nextLock = null
-    var nextPolkit = null
-    if (shell && typeof shell.serviceFor === "function") {
-      nextLock = shell.serviceFor("omarchy.lock")
-      nextPolkit = shell.serviceFor("omarchy.polkit")
+  function suppressGuide() {
+    if (guideVisible || guideAwaitingLockCheck) clearGuide()
+  }
+
+  function evaluatePendingGuide() {
+    if (!guideAwaitingLockCheck) return false
+    if (!lockStateKnown || !credentialPromptStateKnown) return false
+    if (desktopLocked || credentialPromptActive) {
+      clearGuide()
+      return false
     }
-    lockService = nextLock
-    polkitService = nextPolkit
-    desktopLocked = !!(lockService && lockService.locked === true)
-    credentialPromptActive = !!(polkitService && polkitService.dialogVisible === true)
+    guideAwaitingLockCheck = false
+    guideVisible = true
+    return true
+  }
+
+  function setLockStateUnknown() {
+    lockStateKnown = false
+    desktopLocked = true
+    suppressGuide()
+  }
+
+  function recordLockStatus(raw, exitCode) {
+    var parsed = Model.parseLockStatus(raw, exitCode)
+    if (!parsed.ok) {
+      setDiagnostic("lockQueryFailures", 1)
+      setLockStateUnknown()
+      return false
+    }
+    lockStateKnown = true
+    desktopLocked = parsed.locked
+    if (desktopLocked) suppressGuide()
+    else evaluatePendingGuide()
+    return true
+  }
+
+  function requestLockStatus(forGuide) {
+    if (lockStatusProcess.running) {
+      if (forGuide === true) lockStatusRefreshPending = true
+      return false
+    }
+    lockStatusTimeoutTimer.restart()
+    lockStatusProcess.running = true
+    return true
+  }
+
+  function requestLayerStatus() {
+    if (layerStatusProcess.running) {
+      layerRefreshPending = true
+      return false
+    }
+    layerStatusDebounceTimer.restart()
+    return true
+  }
+
+  function handlePolkitLayerEvent(name, data) {
+    if (!Model.isPolkitLayerEvent(name, data)) return false
+    layerEventRevision += 1
+    if (name === "openlayer") {
+      credentialPromptStateKnown = true
+      credentialPromptActive = true
+    } else {
+      // Keep the guide hidden until a fresh inventory confirms that every
+      // Omarchy Polkit surface has closed, including on multi-monitor setups.
+      credentialPromptStateKnown = false
+      credentialPromptActive = true
+    }
+    suppressGuide()
+    requestLayerStatus()
+    return true
+  }
+
+  function recordLayerStatus(raw, exitCode) {
+    if (layerRequestRevision !== layerEventRevision) {
+      requestLayerStatus()
+      return false
+    }
+    var parsed = Model.parseLayerStatus(raw, exitCode)
+    if (!parsed.ok) {
+      credentialPromptStateKnown = false
+      credentialPromptActive = true
+      setDiagnostic("layerQueryFailures", 1)
+      suppressGuide()
+      return false
+    }
+    credentialPromptStateKnown = true
+    credentialPromptActive = parsed.active
+    if (credentialPromptActive) suppressGuide()
+    else evaluatePendingGuide()
+    return true
   }
 
   function applyIntegrationResult(raw, exitCode) {
     if (exitCode !== 0) {
       integrationState = "error"
+      integrationStateKnown = false
       setDiagnostic("integrationFailures", 1)
       return false
     }
     var parsed
     try { parsed = JSON.parse(String(raw || "")) } catch (e) {
       integrationState = "error"
+      integrationStateKnown = false
       setDiagnostic("integrationFailures", 1)
       return false
     }
     integrationDetails = parsed
-    if (parsed.managedBlockState === "present") integrationState = "enabled"
+    if (parsed.managedBlockState === "present") {
+      integrationState = "enabled"
+      integrationStateKnown = true
+      if (deferredBridgeReloadSourceHash !== "") {
+        var deferredHash = deferredBridgeReloadSourceHash
+        deferredBridgeReloadSourceHash = ""
+        requestCatalogBridgeReload(deferredHash)
+      }
+    }
     else if (parsed.managedBlockState === "absent") {
       integrationState = (integrationState === "enabled" || integrationState === "disconnected")
         ? "disconnected" : "disabled"
-      guideVisible = false
-      activeModifiers = ""
-      activeGuideRoot = ""
+      integrationStateKnown = true
+      deferredBridgeReloadSourceHash = ""
+      pendingBridgeReloadSourceHash = ""
+      clearGuide()
       highlightedBindingId = ""
-    } else integrationState = "error"
+    } else {
+      integrationState = "error"
+      integrationStateKnown = false
+    }
     return integrationState !== "error"
   }
 
@@ -324,6 +427,7 @@ Item {
     var hash = String(expectedHash || "")
     if (!hash || integrationMutationProcess.running || controllerPath === "") return false
     integrationState = "enabling"
+    integrationStateKnown = false
     integrationMutationAction = action
     integrationMutationProcess.command = [controllerPath, action, "--expected-hash", hash]
     integrationMutationProcess.running = true
@@ -361,6 +465,8 @@ Item {
   function handleRawEvent(event) {
     if (!event) return
     var name = String(event.name || "")
+    var data = String(event.data || "")
+    if (handlePolkitLayerEvent(name, data)) return
     if (name === "custom") {
       var payload = protocolPayload(event)
       if (payload !== "") handleProtocolEvent(payload)
@@ -380,8 +486,62 @@ Item {
   property bool catalogRegenerationPending: false
   property string generatorOutput: ""
 
+  function scheduleBridgeReloadForChangedCatalog(sourceHash) {
+    var hash = String(sourceHash || "")
+    if (hash === "") return false
+    if (integrationState === "enabled") return requestCatalogBridgeReload(hash)
+    if (!integrationStateKnown || integrationState === "enabling") {
+      deferredBridgeReloadSourceHash = hash
+      return true
+    }
+    deferredBridgeReloadSourceHash = ""
+    return false
+  }
+
+  function requestCatalogBridgeReload(sourceHash) {
+    var generation = { ok: true, sourceHash: String(sourceHash || ""), changed: true }
+    if (integrationState !== "enabled") return false
+    if (catalogBridgeReloadProcess.running) {
+      if (generation.sourceHash === activeBridgeReloadSourceHash) {
+        pendingBridgeReloadSourceHash = ""
+        return false
+      }
+      pendingBridgeReloadSourceHash = generation.sourceHash
+      return true
+    }
+    if (!Model.shouldReloadCatalogBridge(
+          generation,
+          integrationState,
+          lastBridgeReloadSourceHash,
+          activeBridgeReloadSourceHash,
+          pendingBridgeReloadSourceHash)) return false
+    activeBridgeReloadSourceHash = generation.sourceHash
+    catalogBridgeReloadProcess.command = ["hyprctl", "reload"]
+    catalogBridgeReloadProcess.running = true
+    return true
+  }
+
+  function completeCatalogPublication(loaded) {
+    var generation = pendingCatalogGeneration
+    pendingCatalogGeneration = null
+    catalogPublicationPending = false
+    if (loaded && generation) {
+      if (integrationState === "enabled" && catalogBridgeReloadProcess.running) {
+        pendingBridgeReloadSourceHash = Model.pendingBridgeReloadAfterCatalog(
+              generation.sourceHash,
+              activeBridgeReloadSourceHash)
+      } else if (generation.changed) {
+        scheduleBridgeReloadForChangedCatalog(generation.sourceHash)
+      }
+    }
+    if (catalogRegenerationPending) {
+      catalogRegenerationPending = false
+      catalogChangeTimer.restart()
+    }
+  }
+
   function regenerateCatalog() {
-    if (catalogGenerationProcess.running) {
+    if (catalogGenerationProcess.running || catalogPublicationPending) {
       catalogRegenerationPending = true
       return false
     }
@@ -395,12 +555,17 @@ Item {
   FileView {
     id: catalogFile
     path: root.stateDir + "/catalog.json"
-    watchChanges: true
-    onLoaded: root.loadCatalog(text())
+    watchChanges: false
+    onLoaded: {
+      var publicationPending = root.catalogPublicationPending
+      var loaded = root.loadCatalog(text())
+      if (publicationPending) root.completeCatalogPublication(loaded)
+    }
     onLoadFailed: {
       root.catalog = null
       root.catalogState = "error"
       root.setDiagnostic("catalogLoadFailures", 1)
+      if (root.catalogPublicationPending) root.completeCatalogPublication(false)
     }
   }
 
@@ -408,17 +573,37 @@ Item {
     id: catalogGenerationProcess
     running: false
     stdout: StdioCollector { id: generatorStdout; waitForEnd: true }
-    onExited: {
+    onExited: function(exitCode, exitStatus) {
       root.generatorOutput = String(generatorStdout.text || "")
-      if (exitCode !== 0) {
+      var generated = Model.parseCatalogGeneration(root.generatorOutput, exitCode)
+      if (!generated.ok) {
         root.catalogState = "error"
         root.setDiagnostic("catalogLoadFailures", 1)
-      } else {
-        catalogFile.reload()
+        if (root.catalogRegenerationPending) {
+          root.catalogRegenerationPending = false
+          catalogChangeTimer.restart()
+        }
+        return
       }
-      if (root.catalogRegenerationPending) {
-        root.catalogRegenerationPending = false
-        catalogChangeTimer.restart()
+      root.pendingCatalogGeneration = generated
+      root.catalogPublicationPending = true
+      catalogFile.reload()
+    }
+  }
+
+  Process {
+    id: catalogBridgeReloadProcess
+    running: false
+    onExited: function(exitCode, exitStatus) {
+      var completedHash = root.activeBridgeReloadSourceHash
+      root.activeBridgeReloadSourceHash = ""
+      if (exitCode === 0) root.lastBridgeReloadSourceHash = completedHash
+      else root.setDiagnostic("integrationFailures", 1)
+
+      if (root.pendingBridgeReloadSourceHash !== "") {
+        var pendingHash = root.pendingBridgeReloadSourceHash
+        root.pendingBridgeReloadSourceHash = ""
+        Qt.callLater(function() { root.requestCatalogBridgeReload(pendingHash) })
       }
     }
   }
@@ -447,6 +632,7 @@ Item {
       try { parsed = JSON.parse(String(integrationMutationStdout.text || "")) } catch (e) {}
       if (exitCode !== 0 || !parsed || parsed.ok !== true) {
         root.integrationState = "error"
+        root.integrationStateKnown = false
         root.setDiagnostic("integrationFailures", 1)
       } else {
         root.integrationDetails = parsed
@@ -486,6 +672,134 @@ Item {
     }
   }
 
+  Timer {
+    id: lockStatusTimeoutTimer
+    interval: 1000
+    repeat: false
+    onTriggered: {
+      if (!lockStatusProcess.running) return
+      root.lockStatusTimedOut = true
+      root.setDiagnostic("lockQueryFailures", 1)
+      root.setLockStateUnknown()
+      lockStatusProcess.signal(9)
+    }
+  }
+
+  Timer {
+    id: lockStatusRetryTimer
+    interval: 1000
+    repeat: true
+    running: true
+    onTriggered: {
+      if (!root.lockStateKnown && !lockStatusProcess.running)
+        root.requestLockStatus(false)
+    }
+  }
+
+  Timer {
+    id: visibleLockRefreshTimer
+    interval: 100
+    repeat: true
+    running: root.guideVisible
+    onTriggered: root.requestLockStatus(false)
+  }
+
+  Process {
+    id: lockStatusProcess
+    command: ["omarchy-shell", "lock", "isLocked"]
+    running: false
+    stdout: StdioCollector { id: lockStatusStdout; waitForEnd: true }
+    onExited: {
+      lockStatusTimeoutTimer.stop()
+      if (root.lockStatusTimedOut) {
+        root.lockStatusTimedOut = false
+        if (root.lockStatusRefreshPending) {
+          root.lockStatusRefreshPending = false
+          Qt.callLater(function() { root.requestLockStatus(false) })
+        }
+        return
+      }
+      if (root.lockStatusRefreshPending) {
+        root.lockStatusRefreshPending = false
+        Qt.callLater(function() { root.requestLockStatus(false) })
+        return
+      }
+      root.recordLockStatus(lockStatusStdout.text, exitCode)
+    }
+  }
+
+  Timer {
+    id: layerStatusDebounceTimer
+    interval: 40
+    repeat: false
+    onTriggered: {
+      if (layerStatusProcess.running) {
+        root.layerRefreshPending = true
+        return
+      }
+      root.layerRefreshPending = false
+      root.layerRequestRevision = root.layerEventRevision
+      root.layerStatusTimedOut = false
+      layerStatusTimeoutTimer.restart()
+      layerStatusProcess.running = true
+    }
+  }
+
+  Timer {
+    id: layerStatusRetryTimer
+    interval: 1000
+    repeat: true
+    running: true
+    onTriggered: {
+      if ((!root.credentialPromptStateKnown || root.credentialPromptActive)
+          && !layerStatusProcess.running)
+        root.requestLayerStatus()
+    }
+  }
+
+  Timer {
+    id: layerStatusTimeoutTimer
+    interval: 1000
+    repeat: false
+    onTriggered: {
+      if (!layerStatusProcess.running) return
+      root.layerStatusTimedOut = true
+      root.credentialPromptStateKnown = false
+      root.credentialPromptActive = true
+      root.setDiagnostic("layerQueryFailures", 1)
+      root.suppressGuide()
+      layerStatusProcess.signal(9)
+    }
+  }
+
+  Process {
+    id: layerStatusProcess
+    command: ["hyprctl", "-j", "layers"]
+    running: false
+    stdout: StdioCollector { id: layerStatusStdout; waitForEnd: true }
+    onExited: {
+      layerStatusTimeoutTimer.stop()
+      if (root.layerStatusTimedOut) {
+        root.layerStatusTimedOut = false
+        if (root.layerRefreshPending) {
+          root.layerRefreshPending = false
+          Qt.callLater(function() { root.requestLayerStatus() })
+        }
+        return
+      }
+      if (root.layerRequestRevision !== root.layerEventRevision) {
+        root.layerRefreshPending = false
+        Qt.callLater(function() { root.requestLayerStatus() })
+        return
+      }
+      root.recordLayerStatus(layerStatusStdout.text, exitCode)
+      if (root.layerRefreshPending) {
+        root.layerRefreshPending = false
+        Qt.callLater(function() { root.requestLayerStatus() })
+      }
+    }
+  }
+
   Connections {
     target: Hyprland
     function onRawEvent(event) { root.handleRawEvent(event) }
@@ -494,28 +808,7 @@ Item {
   Connections {
     target: root.shell
     ignoreUnknownSignals: true
-    function onShellConfigChanged() { root.syncSettings() }
-  }
-
-  Connections {
-    target: root.lockService
-    ignoreUnknownSignals: true
-    function onLockedChanged() { root.refreshSuppressionServices() }
-  }
-
-  Connections {
-    target: root.polkitService
-    ignoreUnknownSignals: true
-    function onDialogVisibleChanged() { root.refreshSuppressionServices() }
-  }
-
-  Timer {
-    id: suppressionRefreshTimer
-    interval: 1000
-    repeat: true
-    running: true
-    triggeredOnStart: true
-    onTriggered: root.refreshSuppressionServices()
+    function onBarConfigChanged() { root.syncSettings() }
   }
 
   IpcHandler {
@@ -526,17 +819,17 @@ Item {
 
   Component.onCompleted: Qt.callLater(function() {
     root.syncSettings()
-    root.refreshSuppressionServices()
     root.inspectIntegration()
     manualSnippetProcess.command = [root.controllerPath, "manual-snippet"]
     manualSnippetProcess.running = true
     root.regenerateCatalog()
     root.requestFullscreenRefresh()
+    root.requestLockStatus(false)
+    root.requestLayerStatus()
   })
 
   onShellChanged: Qt.callLater(function() {
     root.syncSettings()
-    root.refreshSuppressionServices()
   })
 
   SuperGuide {

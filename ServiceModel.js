@@ -162,18 +162,30 @@ function normalizeGuideRoot(value) {
   return value !== false
 }
 
-function settingsFor(config, moduleName) {
-  if (!isObject(config) || !isObject(config.bar) || !isObject(config.bar.layout)) return {}
+function settingsFor(barConfig, moduleName) {
+  if (!isObject(barConfig) || !isObject(barConfig.layout)) return {}
   var sections = ["left", "center", "right"]
+  var targetId = String(moduleName || "")
   for (var s = 0; s < sections.length; s++) {
-    var entries = config.bar.layout[sections[s]]
+    var entries = barConfig.layout[sections[s]]
     if (!Array.isArray(entries)) continue
     for (var i = 0; i < entries.length; i++) {
       var entry = entries[i]
-      if (isObject(entry) && String(entry.id || "") === moduleName) return entry
+      if (isObject(entry) && String(entry.id || "") === targetId) return entry
     }
   }
   return {}
+}
+
+function updatedSettingsEntry(entry, changes, moduleName) {
+  var next = { id: String(moduleName || "") }
+  if (isObject(entry)) {
+    for (var key in entry) if (key !== "id") next[key] = entry[key]
+  }
+  if (isObject(changes)) {
+    for (var changed in changes) if (changed !== "id") next[changed] = changes[changed]
+  }
+  return next
 }
 
 function parseActiveWindow(raw) {
@@ -188,8 +200,92 @@ function parseActiveWindow(raw) {
   return { ok: false, error: "missing-fullscreen" }
 }
 
+function parseLockStatus(raw, exitCode) {
+  if (exitCode !== 0) return { ok: false, error: "lock-query-failed" }
+  if (typeof raw !== "string") return { ok: false, error: "invalid-lock-status" }
+  var value = raw.trim()
+  if (value === "true") return { ok: true, locked: true }
+  if (value === "false") return { ok: true, locked: false }
+  return { ok: false, error: "invalid-lock-status" }
+}
+
+function parseLayerStatus(raw, exitCode) {
+  if (exitCode !== 0) return { ok: false, error: "layer-query-failed" }
+  var value = raw
+  if (typeof value === "string") {
+    try { value = JSON.parse(value) } catch (e) { return { ok: false, error: "invalid-layer-json" } }
+  }
+  if (!isObject(value)) return { ok: false, error: "invalid-layer-status" }
+
+  var monitors = Object.keys(value)
+  if (monitors.length === 0) return { ok: false, error: "missing-layer-monitors" }
+  for (var m = 0; m < monitors.length; m++) {
+    var monitor = value[monitors[m]]
+    if (!isObject(monitor) || !isObject(monitor.levels))
+      return { ok: false, error: "invalid-layer-monitor" }
+    var levels = Object.keys(monitor.levels)
+    if (levels.length === 0) return { ok: false, error: "missing-layer-levels" }
+    for (var l = 0; l < levels.length; l++) {
+      var layers = monitor.levels[levels[l]]
+      if (!Array.isArray(layers)) return { ok: false, error: "invalid-layer-list" }
+      for (var i = 0; i < layers.length; i++) {
+        var layer = layers[i]
+        if (!isObject(layer) || typeof layer.namespace !== "string")
+          return { ok: false, error: "invalid-layer-entry" }
+        if (layer.namespace === "omarchy-polkit") return { ok: true, active: true }
+      }
+    }
+  }
+  return { ok: true, active: false }
+}
+
+function isPolkitLayerEvent(name, data) {
+  var eventName = String(name || "")
+  return (eventName === "openlayer" || eventName === "closelayer")
+    && String(data || "").trim() === "omarchy-polkit"
+}
+
 function isCatalogChangeEvent(name) {
   return ["configreloaded", "configreloadedv2", "activelayout", "activekeyboardlayout", "keyboardlayout"].indexOf(String(name || "")) !== -1
+}
+
+function parseCatalogGeneration(raw, exitCode) {
+  if (Number(exitCode) !== 0) return { ok: false, error: "generator-failed" }
+  var result
+  try { result = JSON.parse(String(raw || "")) } catch (e) {
+    return { ok: false, error: "invalid-generator-output" }
+  }
+  if (!isObject(result) || result.ok !== true
+      || typeof result.sourceHash !== "string"
+      || !/^sha256:[0-9a-f]{64}$/.test(result.sourceHash)
+      || typeof result.changed !== "boolean"
+      || !Number.isInteger(result.bindingCount) || result.bindingCount < 0) {
+    return { ok: false, error: "invalid-generator-result" }
+  }
+  return {
+    ok: true,
+    sourceHash: result.sourceHash,
+    changed: result.changed,
+    bindingCount: result.bindingCount
+  }
+}
+
+function shouldReloadCatalogBridge(generation, integrationState, lastReloadHash, activeReloadHash, pendingReloadHash) {
+  return isObject(generation)
+    && generation.ok === true
+    && generation.changed === true
+    && integrationState === "enabled"
+    && typeof generation.sourceHash === "string"
+    && /^sha256:[0-9a-f]{64}$/.test(generation.sourceHash)
+    && generation.sourceHash !== String(lastReloadHash || "")
+    && generation.sourceHash !== String(activeReloadHash || "")
+    && generation.sourceHash !== String(pendingReloadHash || "")
+}
+
+function pendingBridgeReloadAfterCatalog(sourceHash, activeReloadHash) {
+  var hash = String(sourceHash || "")
+  if (!/^sha256:[0-9a-f]{64}$/.test(hash) || hash === String(activeReloadHash || "")) return ""
+  return hash
 }
 
 function isFullscreenEvent(name) {

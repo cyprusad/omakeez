@@ -77,38 +77,24 @@ if type(existing) == "table" then
   return
 end
 
+-- A missing or malformed catalog leaves the bridge inert. The service will
+-- request a Hyprland reload after publishing a valid catalog; never retry file
+-- access from the keyboard callback.
+local initial_catalog, initial_modifiers = load_catalog()
+if not initial_catalog then return end
+
 -- All state below is process-local and disappears when Hyprland exits. There
 -- is intentionally no history, counter, timestamp, or raw input buffer.
 local bridge = {
-  enabled = false,
-  catalog = nil,
-  modifiers = empty_modifiers(),
+  enabled = true,
+  catalog = initial_catalog,
+  modifiers = initial_modifiers,
   held = { SUPER = {}, SHIFT = {}, CTRL = {}, ALT = {} },
   submap = "",
   guideRoot = nil,
   emitting = false,
 }
 _G[STATE_NAME] = bridge
-
--- Catalog generation happens asynchronously in the shell service. Before its
--- first successful result the bridge stays inert. If an early load fails, the
--- next keyboard callback retries this small local catalog load so a shell
--- restart is not required; once enabled, normal callbacks read memory only.
-local function refresh_catalog()
-  local catalog, modifiers = load_catalog()
-  if not catalog then
-    bridge.enabled = false
-    bridge.catalog = nil
-    bridge.modifiers = empty_modifiers()
-    return false
-  end
-  bridge.enabled = true
-  bridge.catalog = catalog
-  bridge.modifiers = modifiers
-  return true
-end
-
-refresh_catalog()
 
 -- Do not emit arbitrary strings even if a malformed catalog supplied one.
 local function valid_id(value)
@@ -158,7 +144,7 @@ end
 -- the four configured modifier codes, an event is reduced to a numeric lookup
 -- key; unmatched codes immediately disappear. No event is persisted or sent.
 hl.on("input.keyboard.key", function(keycode, timestamp, event_state)
-  if not bridge.enabled and not refresh_catalog() then return end
+  if not bridge.enabled then return end
   local code, state
   if type(keycode) == "table" then
     code = tonumber(event_value(keycode, "keycode", event_value(keycode, "code", 0)))

@@ -11,8 +11,12 @@ updates before installing them.
   Omakeez's own bridge block.
 - `hyprctl binds` and the current XKB keymap, only to generate a display
   catalog and match allowlist.
-- Omarchy shell state that exposes lock, Polkit credential-dialog, fullscreen,
-  and lifecycle suppression.
+- The public `omarchy-shell lock isLocked` result, which is parsed as exactly
+  `true` or `false` and is never queried for authentication details.
+- Hyprland layer inventory and layer lifecycle events, filtered to the exact
+  `omarchy-polkit` namespace so the guide can stay hidden during Omarchy's
+  credential dialog.
+- Active-window fullscreen state and plugin lifecycle state.
 - The generated `catalog.json` and `bridge-catalog.lua` files described below.
 
 ## What Omakeez writes
@@ -28,7 +32,11 @@ ${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/omakeez/
 The leaf state directory is user-owned with mode `0700`; generated files use
 mode `0600`. Catalog generation repairs legacy user-owned state directories
 that were created with broader permissions and rejects symlinked or
-foreign-owned output directories.
+foreign-owned output directories. Controller mutations reject a symlink at
+the final `omakeez` directory, including a dangling symlink, and reject
+foreign-owned or group/world-accessible state directories before changing
+them. Symlinks in parent directories are allowed, so a relocated
+`XDG_STATE_HOME` remains supported.
 
 | File or directory | Purpose |
 |---|---|
@@ -57,6 +65,13 @@ The bridge does not use `/dev/input`, evdev, sockets, subprocesses, root,
 load can retry after asynchronous catalog generation; after that, normal input
 matching is in-memory. The only external URL in the plugin is the user-clicked
 browser link to the public bridge source.
+
+The shell service checks lock state through the public `lock isLocked` IPC
+method only. It does not access the private lock or Polkit service objects. A
+missing, timed-out, malformed, or failed lock/layer query keeps the guide
+hidden. Hyprland's `openlayer`/`closelayer` events are matched against the exact
+`omarchy-polkit` namespace; the service reads a fresh layer inventory after
+startup and layer transitions to account for multiple monitors.
 
 Omakeez does **not** persist typed text, passwords, raw key sequences,
 keybinding-use history, commands, dispatcher arguments, window titles,

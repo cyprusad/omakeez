@@ -26,6 +26,25 @@ third=$("$root/scripts/generate-catalog" --hyprctl-file "$root/tests/fixtures/ca
 printf '%s\n' "$third" | grep -q '"changed":false'
 [ "$(stat -c %a "$out")" = 700 ]
 
+printf 'return {}\n' >"$out/bridge-catalog.lua"
+repaired_bridge=$("$root/scripts/generate-catalog" --hyprctl-file "$root/tests/fixtures/catalog-binds.txt" --keymap-file "$root/tests/fixtures/catalog-keymap.txt" --output-dir "$out")
+printf '%s\n' "$repaired_bridge" | grep -q '"changed":true'
+luac -p "$out/bridge-catalog.lua"
+after_bridge_repair=$("$root/scripts/generate-catalog" --hyprctl-file "$root/tests/fixtures/catalog-binds.txt" --keymap-file "$root/tests/fixtures/catalog-keymap.txt" --output-dir "$out")
+printf '%s\n' "$after_bridge_repair" | grep -q '"changed":false'
+chmod 644 "$out/bridge-catalog.lua"
+repaired_permissions=$("$root/scripts/generate-catalog" --hyprctl-file "$root/tests/fixtures/catalog-binds.txt" --keymap-file "$root/tests/fixtures/catalog-keymap.txt" --output-dir "$out")
+printf '%s\n' "$repaired_permissions" | grep -q '"changed":true'
+[ "$(stat -c %a "$out/bridge-catalog.lua")" = 600 ]
+
+jq '.bindings = []' "$out/catalog.json" >"$fixture/catalog-corrupt.json"
+mv "$fixture/catalog-corrupt.json" "$out/catalog.json"
+repaired_catalog=$("$root/scripts/generate-catalog" --hyprctl-file "$root/tests/fixtures/catalog-binds.txt" --keymap-file "$root/tests/fixtures/catalog-keymap.txt" --output-dir "$out")
+printf '%s\n' "$repaired_catalog" | grep -q '"changed":true'
+jq -e '.schemaVersion == 1 and (.bindings | length == 7)' "$out/catalog.json" >/dev/null
+after_catalog_repair=$("$root/scripts/generate-catalog" --hyprctl-file "$root/tests/fixtures/catalog-binds.txt" --keymap-file "$root/tests/fixtures/catalog-keymap.txt" --output-dir "$out")
+printf '%s\n' "$after_catalog_repair" | grep -q '"changed":false'
+
 ln -s "$out" "$fixture/symlink-state"
 if "$root/scripts/generate-catalog" --hyprctl-file "$root/tests/fixtures/catalog-binds.txt" --keymap-file "$root/tests/fixtures/catalog-keymap.txt" --output-dir "$fixture/symlink-state" >"$fixture/symlink.out" 2>"$fixture/symlink.err"; then
   echo "symlinked output directory accepted" >&2

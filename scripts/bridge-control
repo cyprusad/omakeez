@@ -37,19 +37,121 @@ def fail(code, message):
     raise SystemExit(1)
 
 
+def directory_open_flags():
+    return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
 def prepare_state_dir(path):
+    state_fd = None
     try:
-        if path.exists():
-            info = path.stat()
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            path.mkdir(parents=True, mode=0o700, exist_ok=True)
+        else:
+            if stat.S_ISLNK(info.st_mode):
+                fail("unsafe-state-directory", "state path must not be a symlink")
             if not stat.S_ISDIR(info.st_mode):
                 fail("unsafe-state-directory", "state path is not a directory")
-            if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
-                fail("unsafe-state-directory", "state directory ownership or permissions are unsafe")
-        else:
-            path.mkdir(parents=True, exist_ok=True)
-        os.chmod(path, 0o700)
+
+        # Open the leaf without following a replacement symlink, then validate
+        # and use this descriptor for controller state operations.
+        state_fd = os.open(path, directory_open_flags())
+        info = os.fstat(state_fd)
+        if not stat.S_ISDIR(info.st_mode):
+            os.close(state_fd)
+            state_fd = None
+            fail("unsafe-state-directory", "state path is not a directory")
+        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
+            os.close(state_fd)
+            state_fd = None
+            fail("unsafe-state-directory", "state directory ownership or permissions are unsafe")
+        os.fchmod(state_fd, 0o700)
+        return state_fd
+    except OSError as exc:
+        if state_fd is not None:
+            os.close(state_fd)
+        fail("unsafe-state-directory", str(exc))
+
+
+def open_state_lock(state_fd):
+    lock_fd = None
+    try:
+        lock_fd = os.open(
+            "bridge-control.lock",
+            os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=state_fd,
+        )
+        info = os.fstat(lock_fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            os.close(lock_fd)
+            lock_fd = None
+            fail("unsafe-state-directory", "controller lock is not a user-owned regular file")
+        os.fchmod(lock_fd, 0o600)
+        lock = os.fdopen(lock_fd, "a+")
+        lock_fd = None
+        return lock
+    except OSError as exc:
+        if lock_fd is not None:
+            os.close(lock_fd)
+        fail("unsafe-state-directory", str(exc))
+
+
+def open_state_subdirectory(parent_fd, name):
+    try:
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            pass
+        directory_fd = os.open(name, directory_open_flags(), dir_fd=parent_fd)
+        info = os.fstat(directory_fd)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            os.close(directory_fd)
+            fail("unsafe-state-directory", f"{name} is not a user-owned directory")
+        os.fchmod(directory_fd, 0o700)
+        return directory_fd
     except OSError as exc:
         fail("unsafe-state-directory", str(exc))
+
+
+def write_state_file(directory_fd, name, content):
+    file_fd = None
+    try:
+        file_fd = os.open(
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=directory_fd,
+        )
+        os.fchmod(file_fd, 0o600)
+        with os.fdopen(file_fd, "wb") as handle:
+            file_fd = None
+            handle.write(content)
+    except OSError as exc:
+        if file_fd is not None:
+            os.close(file_fd)
+        fail("unsafe-state-directory", str(exc))
+
+
+def create_backup(state_fd, state_dir, current_hash, original, metadata):
+    backups_fd = open_state_subdirectory(state_fd, "backups")
+    backup_name = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + current_hash[7:19]
+    try:
+        os.mkdir(backup_name, 0o700, dir_fd=backups_fd)
+        backup_fd = os.open(backup_name, directory_open_flags(), dir_fd=backups_fd)
+        info = os.fstat(backup_fd)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            os.close(backup_fd)
+            fail("unsafe-state-directory", "backup path is not a user-owned directory")
+        os.fchmod(backup_fd, 0o700)
+        write_state_file(backup_fd, "content", original)
+        write_state_file(backup_fd, "metadata.json", (json.dumps(metadata, indent=2) + "\n").encode("utf-8"))
+        return state_dir / "backups" / backup_name, backup_fd
+    except OSError as exc:
+        fail("unsafe-state-directory", str(exc))
+    finally:
+        os.close(backups_fd)
 
 
 def backup_list(state_dir):
@@ -269,10 +371,15 @@ def mutate(command, args):
         fail("missing-hyprctl", "hyprctl is required for live configuration reload")
     logical = args.config or default_config()
     state_dir = args.state_dir or default_state()
-    prepare_state_dir(state_dir)
-    lock_path = state_dir / "bridge-control.lock"
-    with lock_path.open("a+") as lock:
-        os.chmod(lock_path, 0o600)
+    state_fd = prepare_state_dir(state_dir)
+    try:
+        mutate_with_state_dir(command, args, logical, state_dir, state_fd)
+    finally:
+        os.close(state_fd)
+
+
+def mutate_with_state_dir(command, args, logical, state_dir, state_fd):
+    with open_state_lock(state_fd) as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         before = inspect(logical, state_dir)
         if not before["safeToPatch"]:
@@ -301,13 +408,7 @@ def mutate(command, args):
         finally:
             if os.path.exists(syntax_path):
                 os.unlink(syntax_path)
-        backup = state_dir / "backups" / (time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + before["currentHash"][7:19])
-        backup.mkdir(parents=True, exist_ok=False)
-        os.chmod(backup, 0o700)
-        (backup / "content").write_bytes(original)
-        os.chmod(backup / "content", 0o600)
-        (backup / "metadata.json").write_text(json.dumps(before, indent=2) + "\n")
-        os.chmod(backup / "metadata.json", 0o600)
+        backup, backup_fd = create_backup(state_fd, state_dir, before["currentHash"], original, before)
         fd, temporary = tempfile.mkstemp(prefix=".omakeez.", dir=target.parent)
         try:
             os.fchmod(fd, 0o600)
@@ -326,7 +427,7 @@ def mutate(command, args):
             errors = subprocess.run(["hyprctl", "configerrors"], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             if reload_result.returncode != 0 or errors.returncode != 0 or errors.stdout.strip():
                 if "sha256:" + hashlib.sha256(target.read_bytes()).hexdigest() == new_hash:
-                    os.replace(backup / "content", target)
+                    os.replace("content", target, src_dir_fd=backup_fd)
                     rolled_back = True
                 else:
                     fail("concurrent-change", "target changed before rollback")
@@ -334,6 +435,7 @@ def mutate(command, args):
                 rolled_back = False
         else:
             rolled_back = False
+        os.close(backup_fd)
         output({"ok": True, "changed": True, "logicalPath": str(logical), "resolvedPath": str(target), "oldHash": before["currentHash"], "newHash": new_hash, "backupPath": str(backup), "validation": "skipped" if args.no_live_reload else "passed", "rolledBack": rolled_back})
 
 
